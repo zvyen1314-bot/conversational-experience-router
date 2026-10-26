@@ -2,21 +2,25 @@ import { readdir, readFile } from "node:fs/promises";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ExperienceModule, ExperienceModuleImplementation } from "./module-api.js";
+import { IsolatedExperienceModule } from "./module-worker-host.js";
 import { experienceManifestSchema } from "./protocol.js";
 import { isTrustedPublicKey, moduleDigests, verifyModuleSignature } from "./signature.js";
 import type { ExperienceManifest, ExperienceRegistryEntry, ModuleSignature, ModuleSignatureStatus } from "./types.js";
 
 export interface ModuleRegistryOptions {
   trustedKeys?: Record<string, string>;
+  isolateModules?: boolean;
 }
 
 export class ModuleRegistry {
   private readonly modules = new Map<string, ExperienceModule>();
   private readonly metadata = new Map<string, ExperienceRegistryEntry>();
   private trustedKeys: Record<string, string>;
+  private readonly isolateModules: boolean;
 
   constructor(options: ModuleRegistryOptions = {}) {
     this.trustedKeys = { ...(options.trustedKeys ?? {}) };
+    this.isolateModules = options.isolateModules === true;
   }
 
   setTrustedKeys(trustedKeys: Record<string, string>): void {
@@ -64,6 +68,12 @@ export class ModuleRegistry {
     return this.modules.size;
   }
 
+  close(): void {
+    for (const module of this.modules.values()) {
+      if (module instanceof IsolatedExperienceModule) module.close();
+    }
+  }
+
   private async loadModule(moduleDir: string): Promise<void> {
     const manifestPath = join(moduleDir, "manifest.json");
     const modulePath = await findModuleEntry(moduleDir);
@@ -75,17 +85,20 @@ export class ModuleRegistry {
     const signatureResult = await readModuleSignature(moduleDir);
     const verification = verifyRegistrySignature(manifest, entrySource, signatureResult, this.trustedKeys);
 
-    const imported = await import(pathToFileURL(modulePath).href);
-    const implementation = (imported.default ?? imported) as Partial<ExperienceModuleImplementation>;
-    if (typeof implementation.start !== "function" || typeof implementation.handleEvent !== "function") {
-      throw new Error(`Module ${manifest.id} must export start and handleEvent functions`);
+    if (this.isolateModules) {
+      this.modules.set(manifest.id, new IsolatedExperienceModule(manifest, modulePath));
+    } else {
+      const imported = await import(pathToFileURL(modulePath).href);
+      const implementation = (imported.default ?? imported) as Partial<ExperienceModuleImplementation>;
+      if (typeof implementation.start !== "function" || typeof implementation.handleEvent !== "function") {
+        throw new Error(`Module ${manifest.id} must export start and handleEvent functions`);
+      }
+      this.modules.set(manifest.id, {
+        manifest,
+        start: implementation.start,
+        handleEvent: implementation.handleEvent,
+      });
     }
-
-    this.modules.set(manifest.id, {
-      manifest,
-      start: implementation.start,
-      handleEvent: implementation.handleEvent,
-    });
     const digests = moduleDigests(manifest, entrySource);
     this.metadata.set(manifest.id, {
       manifest,
@@ -108,7 +121,7 @@ export function defaultModulesDirectory(): string {
 }
 
 export async function loadDefaultModuleRegistry(): Promise<ModuleRegistry> {
-  const registry = new ModuleRegistry();
+  const registry = new ModuleRegistry({ isolateModules: process.env.EXPERIENCE_ISOLATE_MODULES === "1" });
   await loadTrustedKeysFromEnvironment(registry);
   const directory = process.env.EXPERIENCE_MODULES_DIR
     ? resolve(process.env.EXPERIENCE_MODULES_DIR)

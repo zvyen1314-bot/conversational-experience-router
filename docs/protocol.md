@@ -141,6 +141,31 @@ create topic
 
 The MCP adapter exposes `discover_public_topics`, `create_public_topic`, `join_public_room`, `get_public_room`, `post_public_message`, `report_public_content`, `list_public_reports`, `review_public_report`, `block_public_actor`, and `unblock_public_actor`. The local HTTP adapter mirrors these under `/api/topics`, `/api/rooms`, and `/api/moderation`.
 
+## Host Adapter
+
+`experience-host/v1` is the host-neutral JSON envelope. MCP is one adapter; the reference JSON adapter is available at `POST /api/host` and uses the same action names:
+
+```json
+{
+  "protocol": "experience-host/v1",
+  "request_id": "req-123",
+  "action": "discover_experiences",
+  "payload": { "intent": "我很无聊", "max_results": 2 }
+}
+```
+
+Every response preserves `protocol` and `request_id`, and returns either `{ "ok": true, "result": ... }` or `{ "ok": false, "error": { "code", "message" } }`. A host can implement this envelope without depending on the MCP SDK. Bearer tokens remain host and session scoped even when the context and consent policy are portable.
+
+## Durable State and Audit
+
+The service stores runtime state under `EXPERIENCE_STATE_FILE` (default `./data/experience-router.db`). Node.js 22.5+ uses the built-in SQLite backend with WAL; Node.js 20 falls back to an atomic JSON document store. Stored runtime state contains consent metadata and sessions, never the plaintext bearer token. The same store keeps public topics, rooms, reports, blocks, and a bounded audit log.
+
+Audit records describe consent, session, topic, message, moderation, and block transitions. The `get_audit_log` MCP action and host action return records without bearer tokens or raw conversation history. The local store is not encrypted in Alpha; production deployment must protect the file and add encrypted export.
+
+## Capability Policy and Isolation
+
+`EXPERIENCE_ALLOWED_CAPABILITIES` is an optional comma-separated host allowlist. A module whose manifest declares a capability outside the allowlist is rejected before a consent token is issued. The service entrypoint runs modules in a child process and communicates through a small lifecycle RPC; `EXPERIENCE_ISOLATE_MODULES=0` disables that boundary for debugging. Child-process isolation limits crash propagation but is not an OS-level security sandbox.
+
 ## Module lifecycle
 
 ```text
@@ -156,7 +181,7 @@ discover
 
 ## Current limitations
 
-`controlled-js` modules are local and run in the MCP process. Signatures detect changes and trust maps identify configured publisher keys, but they do not sandbox code. The public topic service is ephemeral and has no account, durable storage, remote registry, or private messaging; those controls must exist before third-party modules or real social data are enabled.
+`controlled-js` modules are local and run in a child process when started through the service entrypoint. Signatures detect changes and trust maps identify configured publisher keys, but neither signatures nor child processes replace an OS-level sandbox. The Alpha store is local and unencrypted by default; the public topic service has no account identity, remote registry, or private messaging.
 
 ---
 
@@ -223,4 +248,4 @@ MCP 适配器暴露 `discover_public_topics`、`create_public_topic`、`join_pub
 
 ## 当前限制
 
-`controlled-js` 模块是本地模块，运行在 MCP 进程内。签名能发现改动、信任表能识别已配置的发布者密钥，但它们不能沙盒化代码。公开话题服务是临时的，没有账号、持久化存储、远程注册表或私信；在启用第三方模块或真实社交数据之前，这些控制必须先到位。
+通过服务入口启动时，`controlled-js` 模块会在子进程运行。签名能发现改动、信任表能识别已配置的发布者密钥，但签名和子进程都不能替代 OS 级沙盒。Alpha 的本地存储默认不加密；公开话题服务没有账号身份、远程注册表或私信。

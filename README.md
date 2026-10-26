@@ -10,6 +10,8 @@ An open experience layer for conversational AI. It routes user intents — "I'm 
 
 Claude is the first AI host; other MCP-compatible or similar-protocol hosts can be added later.
 
+Current release: **V1.0 Alpha 1**. It adds durable local state, audit records, capability allowlists, an isolated module process boundary, and the host-neutral `experience-host/v1` JSON adapter. The alpha is ready for protocol and developer integration testing; it is not a hosted public service.
+
 ## Features
 
 - **Intent to experience**: discover and recommend experience modules from the current intent and user-approved interest signals.
@@ -28,7 +30,7 @@ Claude is the first AI host; other MCP-compatible or similar-protocol hosts can 
 
 ## Install and run
 
-Requires Node.js 20 or newer.
+Requires Node.js 20 or newer. Node.js 22.5+ uses the built-in SQLite backend; Node.js 20 falls back to an atomic JSON document store.
 
 ```bash
 npm install
@@ -42,6 +44,18 @@ node dist/index.js
 ```
 
 The MCP service talks over stdio and also starts a localhost-only web server and public-topics HTTP API at `http://127.0.0.1:4317` by default. If the port is taken, an available port is chosen automatically and returned in the `launch_experience` `entrypoint` field; set `EXPERIENCE_PORT` to pin the port.
+
+Alpha runtime settings:
+
+```text
+EXPERIENCE_STATE_FILE=./data/experience-router.db
+EXPERIENCE_TRUSTED_KEYS=./keys/trusted-keys.json
+EXPERIENCE_ALLOWED_CAPABILITIES=text_game,reflection,topic_recommendation
+EXPERIENCE_ISOLATE_MODULES=1
+EXPERIENCE_MODULES_DIR=./experiences
+```
+
+The service exposes the host-neutral adapter at `POST /api/host`; its request and response envelope is documented as `experience-host/v1` in [`docs/protocol.md`](docs/protocol.md).
 
 ## Connect to Claude
 
@@ -90,6 +104,7 @@ Then, for example:
 | `launch_experience` | Start a stateful experience with the confirmed token |
 | `get_consent_status` | Query consent state and scope; never returns the token |
 | `revoke_consent` | Revoke an unused experience consent |
+| `get_audit_log` | Read local consent and session audit records without secrets |
 | `continue_experience` | Read current experience session state |
 | `submit_experience_event` | Submit an answer, hint, restart, or end event |
 | `finish_experience` | End an experience session |
@@ -186,9 +201,11 @@ Call `create_context_envelope` to build the context, then pass the returned enve
 - The router never auto-reads conversation history and never fetches phone or account data without call parameters; the host should only pass interest signals the user explicitly agreed to share.
 - The one-time, short-lived consent token issued by `prepare_experience_launch` is the user control point. It is bound to one module and invalidates after use; experience sessions expire after 10 minutes by default.
 - `create_experience_draft` only produces a declarative draft and never executes user-uploaded native code.
-- `controlled-js` modules still run in the same Node.js process as the MCP server; signatures detect tampering but are not a sandbox.
-- Public topics and rooms are currently in-memory and account-free; reporting requires an explicit moderation action. Real-person matching, private messaging, and dating recommendations are not provided.
-- This is a prototype, not a full social platform or an AI phone operating system.
+- The production entrypoint runs `controlled-js` modules in a child process by default; this is a crash and execution boundary, not a complete OS-level sandbox. Set `EXPERIENCE_ISOLATE_MODULES=0` only for local debugging.
+- Runtime sessions, consent records, audit events, public topics, rooms, reports, and blocks persist in the configured local store. The local store is not encrypted by default.
+- `EXPERIENCE_ALLOWED_CAPABILITIES` can restrict module capability names before consent is issued; an empty value keeps the development default of allowing declared capabilities.
+- Public topics remain account-free and pseudonymous. Real-person matching, private messaging, and dating recommendations are not provided.
+- This is a protocol alpha, not a hosted public service or an AI phone operating system.
 
 ## Project structure
 
@@ -202,6 +219,9 @@ src/
   public-topics.ts public topics, rooms, and moderation state
   module-api.ts    module lifecycle API
   protocol.ts      Manifest, Context Envelope, and Consent Policy protocols
+  host-protocol.ts host-neutral JSON adapter protocol
+  persistence.ts   SQLite / JSON durable document store and audit log
+  module-worker-host.ts child-process module boundary
   types.ts         shared types
   web.ts           local experience web server and session API
 experiences/       built-in modules (manifest + module.mjs)
@@ -303,6 +323,7 @@ claude mcp add experience-router -- node C:\\path\\to\\conversational-experience
 | `launch_experience` | 使用用户确认后的授权令牌启动有状态体验 |
 | `get_consent_status` | 查询授权状态和权限范围，不返回 token |
 | `revoke_consent` | 撤销尚未使用的体验授权 |
+| `get_audit_log` | 读取不含 token 和原始对话的本地审计记录 |
 | `continue_experience` | 读取当前体验会话状态 |
 | `submit_experience_event` | 提交答案、提示、重启或结束事件 |
 | `finish_experience` | 结束一个体验会话 |
@@ -380,7 +401,7 @@ npm run build-registry-index -- --root ./experiences --output ./registry/index.j
 npm test
 ```
 
-当前支持本地 `controlled-js` 模块，适合开发者审阅后导入；远程 GitHub 安装、远程注册表服务、持久化审核和沙盒运行仍属于后续工作，当前不会自动执行陌生仓库中的代码。
+当前支持本地 `controlled-js` 模块，适合开发者审阅后导入；远程 GitHub 安装、远程注册表服务和 OS 级沙盒仍属于后续工作，当前不会自动执行陌生仓库中的代码。
 
 ## 公共协议
 
@@ -399,9 +420,11 @@ npm test
 - 不会自动读取对话历史，也不会在没有调用参数的情况下获取手机或账户数据；宿主只应传入用户明确同意共享的兴趣线索。
 - `prepare_experience_launch` 生成的一次性、限时授权令牌是当前原型的用户控制点。令牌绑定具体模块、使用后立即失效；体验会话默认 10 分钟后过期。
 - `create_experience_draft` 只生成声明式草稿，不会执行用户上传的原生代码。
-- `controlled-js` 模块仍与 MCP 服务运行在同一 Node.js 进程；签名能发现篡改，但不能替代沙盒。
-- 公开话题和房间目前是本地内存、无账号服务；举报需要显式审核操作，暂不提供真人匹配、私信或约会推荐。
-- 本仓库是原型，不是完整社交平台，也不是 AI 手机操作系统。
+- 服务入口默认在子进程中运行 `controlled-js` 模块；这是崩溃和执行边界，还不能替代 OS 级沙盒。调试时可设置 `EXPERIENCE_ISOLATE_MODULES=0`。
+- 体验会话、授权、审计、公开话题、房间、举报和拉黑关系会保存到本地存储，默认不加密。
+- 可用 `EXPERIENCE_ALLOWED_CAPABILITIES` 在签发授权前限制模块能力；不设置时保留开发模式的声明能力。
+- 公开话题仍是无账号的化名服务，暂不提供真人匹配、私信或约会推荐。
+- 本仓库是协议 Alpha，不是托管公共服务，也不是 AI 手机操作系统。
 
 ## 项目结构
 

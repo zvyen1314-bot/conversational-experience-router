@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { listRecommendations } from "./catalog.js";
 import { PublicTopicService } from "./public-topics.js";
+import { createPersistentStore } from "./persistence.js";
 import { ExperienceRuntime } from "./runtime.js";
 import { loadTrustedKeysFromEnvironment, ModuleRegistry, defaultModulesDirectory } from "./registry.js";
 import { createContextEnvelope } from "./protocol.js";
@@ -11,10 +13,10 @@ import { startExperienceWebServer } from "./web.js";
 
 const server = new McpServer({
   name: "conversational-experience-router",
-  version: "0.5.0",
+  version: "1.0.0-alpha.1",
 });
-const registry = new ModuleRegistry();
-const runtime = new ExperienceRuntime(registry);
+const registry = new ModuleRegistry({ isolateModules: process.env.EXPERIENCE_ISOLATE_MODULES !== "0" });
+const runtime = new ExperienceRuntime(registry, { allowedCapabilities: parseAllowedCapabilities() });
 const topics = new PublicTopicService();
 
 function jsonText(value: unknown): { content: [{ type: "text"; text: string }] } {
@@ -384,6 +386,18 @@ server.registerTool(
 );
 
 server.registerTool(
+  "get_audit_log",
+  {
+    title: "Get local audit log",
+    description: "读取授权和体验会话的本地审计记录，不返回 bearer token 或原始对话内容。",
+    inputSchema: {
+      limit: z.number().int().min(1).max(500).optional().default(100),
+    },
+  },
+  async ({ limit }) => jsonText({ protocol: "experience-audit/v1", records: await runtime.getAuditLogAsync(limit) }),
+);
+
+server.registerTool(
   "create_experience_draft",
   {
     title: "Create an experience draft",
@@ -439,13 +453,20 @@ async function main(): Promise<void> {
   const modulesDirectory = process.env.EXPERIENCE_MODULES_DIR ?? defaultModulesDirectory();
   await loadTrustedKeysFromEnvironment(registry);
   await registry.loadFromDirectory(modulesDirectory);
+  const statePath = process.env.EXPERIENCE_STATE_FILE ?? resolve(process.cwd(), "data", "experience-router.db");
+  const store = await createPersistentStore(statePath);
+  runtime.attachStore(store);
+  topics.attachStore(store);
+  await runtime.initialize();
+  await topics.initialize();
   const requestedPort = Number.parseInt(process.env.EXPERIENCE_PORT ?? "4317", 10);
-  const web = await startExperienceWebServer(runtime, Number.isFinite(requestedPort) ? requestedPort : 4317, topics);
+  const web = await startExperienceWebServer(runtime, Number.isFinite(requestedPort) ? requestedPort : 4317, topics, registry);
   const transport = new StdioServerTransport();
   await server.connect(transport);
   const close = () => {
     web.server.close();
-    process.exit(0);
+    registry.close();
+    void store.close().finally(() => process.exit(0));
   };
   process.once("SIGINT", close);
   process.once("SIGTERM", close);
@@ -456,3 +477,9 @@ main().catch((error: unknown) => {
   process.stderr.write(`${message}\n`);
   process.exitCode = 1;
 });
+
+function parseAllowedCapabilities(): string[] | undefined {
+  const value = process.env.EXPERIENCE_ALLOWED_CAPABILITIES;
+  if (!value) return undefined;
+  return [...new Set(value.split(",").map((item) => item.trim()).filter(Boolean))];
+}

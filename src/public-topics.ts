@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { createAuditRecord, type DocumentStore } from "./persistence.js";
 
 export type PublicTopicStatus = "open" | "hidden" | "closed";
 export type PublicMessageStatus = "visible" | "hidden";
@@ -70,13 +71,53 @@ interface StoredRoom {
   messages: PublicMessage[];
 }
 
+interface PersistedTopicState {
+  topics: Array<PublicTopic & { room?: { id: string; topic_id: string; created_at: string; status: "open" | "closed"; participant_ids: string[]; messages: PublicMessage[] } }>;
+  reports: ModerationReport[];
+  blocks: Record<string, string[]>;
+}
+
 export class PublicTopicService {
   private readonly topics = new Map<string, StoredTopic>();
   private readonly reports = new Map<string, ModerationReport>();
   private readonly blocks = new Map<string, Set<string>>();
+  private store?: DocumentStore;
 
   constructor() {
     this.seed();
+  }
+
+  attachStore(store: DocumentStore): void {
+    this.store = store;
+  }
+
+  async initialize(): Promise<void> {
+    if (!this.store) return;
+    const state = await this.store.load<PersistedTopicState>("public-topics-v1");
+    if (!state) {
+      this.persistSoon();
+      return;
+    }
+    this.topics.clear();
+    this.reports.clear();
+    this.blocks.clear();
+    for (const topic of state.topics ?? []) {
+      const { room: persistedRoom, ...topicFields } = topic;
+      const restored: StoredTopic = { ...topicFields };
+      if (persistedRoom) {
+        restored.room = {
+          id: persistedRoom.id,
+          topicId: persistedRoom.topic_id,
+          createdAt: persistedRoom.created_at,
+          status: persistedRoom.status,
+          participantIds: new Set(persistedRoom.participant_ids),
+          messages: persistedRoom.messages.map((message) => ({ ...message })),
+        };
+      }
+      this.topics.set(restored.id, restored);
+    }
+    for (const report of state.reports ?? []) this.reports.set(report.id, { ...report });
+    for (const [actorId, blockedIds] of Object.entries(state.blocks ?? {})) this.blocks.set(actorId, new Set(blockedIds));
   }
 
   discover(input: TopicDiscoveryInput = {}): PublicTopic[] {
@@ -112,6 +153,8 @@ export class PublicTopicService {
       message_count: 0,
     };
     this.topics.set(topic.id, topic);
+    this.audit("topic.created", "topic", topic.id, actorId);
+    this.persistSoon();
     return this.snapshotTopic(topic);
   }
 
@@ -133,6 +176,8 @@ export class PublicTopicService {
     }
     topic.room.participantIds.add(actor);
     topic.participant_count = topic.room.participantIds.size;
+    this.audit("room.joined", "room", topic.room.id, actor, { topic_id: topic.id });
+    this.persistSoon();
     return this.snapshotRoom(topic, actor);
   }
 
@@ -166,6 +211,8 @@ export class PublicTopicService {
     topic.updated_at = message.created_at;
     topic.message_count = topic.room.messages.length;
     topic.participant_count = topic.room.participantIds.size;
+    this.audit("message.created", "message", message.id, actor, { room_id: roomId, topic_id: topic.id });
+    this.persistSoon();
     return this.snapshotRoom(topic, actor);
   }
 
@@ -183,6 +230,8 @@ export class PublicTopicService {
       status: "queued",
     };
     this.reports.set(report.id, report);
+    this.audit("moderation.reported", input.targetType, input.targetId, reporterId, { report_id: report.id });
+    this.persistSoon();
     return { ...report };
   }
 
@@ -202,6 +251,8 @@ export class PublicTopicService {
     report.status = decision === "dismiss" ? "dismissed" : decision === "hide" ? "hidden" : "restored";
     report.reviewer_id = normalizeActorId(reviewerId);
     report.reviewed_at = new Date().toISOString();
+    this.audit("moderation.reviewed", report.target_type, report.target_id, report.reviewer_id, { report_id: report.id, decision });
+    this.persistSoon();
     return { ...report };
   }
 
@@ -212,6 +263,8 @@ export class PublicTopicService {
     const blockedActors = this.blocks.get(actor) ?? new Set<string>();
     blockedActors.add(blocked);
     this.blocks.set(actor, blockedActors);
+    this.audit("actor.blocked", "actor", blocked, actor);
+    this.persistSoon();
     return { actor_id: actor, blocked_actor_id: blocked, blocked: true };
   }
 
@@ -219,6 +272,8 @@ export class PublicTopicService {
     const actor = normalizeActorId(actorId);
     const blocked = normalizeActorId(blockedActorId);
     this.blocks.get(actor)?.delete(blocked);
+    this.audit("actor.unblocked", "actor", blocked, actor);
+    this.persistSoon();
     return { actor_id: actor, blocked_actor_id: blocked, blocked: false };
   }
 
@@ -297,6 +352,34 @@ export class PublicTopicService {
         .filter((message) => message.status === "visible" && !this.cannotView(viewerId, message.author_id))
         .map((message) => ({ ...message })),
     };
+  }
+
+  private persistSoon(): void {
+    if (!this.store) return;
+    const topics = [...this.topics.values()].map((topic) => ({
+      ...this.snapshotTopic(topic),
+      room: topic.room
+        ? {
+            id: topic.room.id,
+            topic_id: topic.id,
+            created_at: topic.room.createdAt,
+            status: topic.room.status,
+            participant_ids: [...topic.room.participantIds],
+            messages: topic.room.messages.map((message) => ({ ...message })),
+          }
+        : undefined,
+    }));
+    const blocks: Record<string, string[]> = {};
+    for (const [actorId, blockedIds] of this.blocks) blocks[actorId] = [...blockedIds];
+    void this.store.save("public-topics-v1", {
+      topics,
+      reports: [...this.reports.values()].map((report) => ({ ...report })),
+      blocks,
+    } satisfies PersistedTopicState);
+  }
+
+  private audit(action: string, resourceType: string, resourceId: string, actorId?: string, metadata: Record<string, unknown> = {}): void {
+    if (this.store) void this.store.appendAudit(createAuditRecord(action, resourceType, resourceId, actorId, metadata));
   }
 }
 

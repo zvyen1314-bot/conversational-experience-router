@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { ModuleRegistry } from "./registry.js";
 import type { ExperienceContext, ExperienceModule } from "./module-api.js";
+import { createAuditRecord, type AuditRecord, type DocumentStore } from "./persistence.js";
 import { buildConsentPolicy, contextEnvelopeSchema, scopeContext, type ConsentPolicy, type ContextEnvelope } from "./protocol.js";
 import type {
   ConsentRequest,
@@ -26,9 +27,13 @@ interface StoredConsent {
   revoked: boolean;
 }
 
+export interface RuntimeOptions {
+  allowedCapabilities?: string[];
+}
+
 export type PrepareLaunchResult =
   | ({ status: "consent_required" } & ConsentRequest)
-  | { status: "not_found" | "invalid_context" | "invalid_scope"; message: string; experienceId: string };
+  | { status: "not_found" | "invalid_context" | "invalid_scope" | "invalid_capability"; message: string; experienceId: string };
 
 export interface SessionActionResult {
   status: "ok" | "invalid" | "expired" | "finished";
@@ -44,12 +49,36 @@ export interface ConsentStatusResult {
   expiresAt?: string;
 }
 
+interface PersistedRuntimeState {
+  consents: StoredConsent[];
+  sessions: ExperienceSession[];
+}
+
 export class ExperienceRuntime {
   private readonly consents = new Map<string, StoredConsent>();
   private readonly sessions = new Map<string, ExperienceSession>();
+  private readonly allowedCapabilities?: Set<string>;
+  private store?: DocumentStore;
+  private auditRecords: AuditRecord[] = [];
   private baseUrl = "http://127.0.0.1:4317";
 
-  constructor(private readonly registry: ModuleRegistry) {}
+  constructor(private readonly registry: ModuleRegistry, options: RuntimeOptions = {}) {
+    this.allowedCapabilities = options.allowedCapabilities ? new Set(options.allowedCapabilities) : undefined;
+  }
+
+  attachStore(store: DocumentStore): void {
+    this.store = store;
+  }
+
+  async initialize(): Promise<void> {
+    if (!this.store) return;
+    const state = await this.store.load<PersistedRuntimeState>("runtime-v1");
+    this.consents.clear();
+    this.sessions.clear();
+    for (const consent of state?.consents ?? []) this.consents.set(consent.tokenHash, consent);
+    for (const session of state?.sessions ?? []) this.sessions.set(session.id, session);
+    this.auditRecords = await this.store.listAudit(5000);
+  }
 
   setBaseUrl(baseUrl: string): void {
     this.baseUrl = baseUrl.replace(/\/$/, "");
@@ -58,6 +87,18 @@ export class ExperienceRuntime {
   prepareLaunch(experienceId: string, contextInput?: unknown, requestedScopes: string[] = []): PrepareLaunchResult {
     const experience = this.registry.get(experienceId)?.manifest;
     if (!experience) return { status: "not_found", experienceId, message: "找不到这个体验模块。" };
+
+    if (this.allowedCapabilities) {
+      const allowedCapabilities = this.allowedCapabilities;
+      const blocked = experience.capabilities.filter((capability) => !allowedCapabilities.has(capability));
+      if (blocked.length > 0) {
+        return {
+          status: "invalid_capability",
+          experienceId,
+          message: `当前宿主策略不允许模块能力：${blocked.join("、")}。`,
+        };
+      }
+    }
 
     let contextEnvelope: ContextEnvelope | undefined;
     if (contextInput !== undefined) {
@@ -91,6 +132,12 @@ export class ExperienceRuntime {
       receiptId,
       revoked: false,
     });
+    this.recordAudit("consent.prepared", "consent", receiptId, undefined, {
+      experience_id: experienceId,
+      scopes: [...policy.allowed_reads, ...policy.allowed_writes],
+      context_fields: Object.keys(contextEnvelope?.fields ?? {}),
+    });
+    this.persistSoon();
 
     return {
       status: "consent_required",
@@ -138,6 +185,11 @@ export class ExperienceRuntime {
 
     consent.used = true;
     const session = await this.createSession(module, consent.contextEnvelope, consent.policy);
+    this.recordAudit("consent.used", "consent", consent.receiptId, undefined, {
+      experience_id: experienceId,
+      session_id: session.id,
+    });
+    this.persistSoon();
     return {
       status: "launched",
       experienceId,
@@ -195,6 +247,8 @@ export class ExperienceRuntime {
       const result = await module.handleEvent(this.context(session), session.state, event);
       session.state = normalizeState(result.state);
       if (result.status) session.status = result.status;
+      this.recordAudit("session.event", "session", session.id, undefined, { event_type: type });
+      this.persistSoon();
       return {
         status: "ok",
         message: result.message ?? session.state.feedback ?? "状态已更新。",
@@ -231,8 +285,24 @@ export class ExperienceRuntime {
   revokeConsent(receiptId: string): ConsentStatusResult {
     const consent = this.findConsent(receiptId);
     if (!consent) return { status: "not_found", consentReceiptId: receiptId };
-    if (!consent.used && consent.expiresAt > Date.now()) consent.revoked = true;
+    if (!consent.used && consent.expiresAt > Date.now()) {
+      consent.revoked = true;
+      this.recordAudit("consent.revoked", "consent", receiptId);
+      this.persistSoon();
+    }
     return this.getConsentStatus(receiptId);
+  }
+
+  getAuditLog(limit = 100): AuditRecord[] {
+    return this.auditRecords
+      .slice(-Math.min(Math.max(limit, 1), 500))
+      .reverse()
+      .map((record) => ({ ...record, metadata: { ...record.metadata } }));
+  }
+
+  async getAuditLogAsync(limit = 100): Promise<AuditRecord[]> {
+    if (this.store) return this.store.listAudit(limit);
+    return this.getAuditLog(limit);
   }
 
   private async createSession(
@@ -298,6 +368,27 @@ export class ExperienceRuntime {
       if (consent.receiptId === receiptId) return consent;
     }
     return undefined;
+  }
+
+  private recordAudit(
+    action: string,
+    resourceType: string,
+    resourceId?: string,
+    actorId?: string,
+    metadata: Record<string, unknown> = {},
+  ): void {
+    const record = createAuditRecord(action, resourceType, resourceId, actorId, metadata);
+    this.auditRecords.push(record);
+    this.auditRecords = this.auditRecords.slice(-5000);
+    if (this.store) void this.store.appendAudit(record);
+  }
+
+  private persistSoon(): void {
+    if (!this.store) return;
+    void this.store.save("runtime-v1", {
+      consents: [...this.consents.values()],
+      sessions: [...this.sessions.values()],
+    } satisfies PersistedRuntimeState);
   }
 }
 

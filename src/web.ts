@@ -1,4 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createJsonHostAdapter, type ExperienceHostAdapter } from "./host-protocol.js";
+import { ModuleRegistry } from "./registry.js";
 import { PublicTopicService, type ModerationReportStatus } from "./public-topics.js";
 import type { SessionSnapshot } from "./types.js";
 import { ExperienceRuntime } from "./runtime.js";
@@ -12,9 +14,11 @@ export async function startExperienceWebServer(
   runtime: ExperienceRuntime,
   requestedPort: number,
   topics = new PublicTopicService(),
+  registry?: ModuleRegistry,
 ): Promise<ExperienceWebServer> {
+  const hostAdapter = registry ? createJsonHostAdapter(registry, runtime) : undefined;
   const server = createServer((request, response) => {
-    void handleRequest(request, response, runtime, topics);
+    void handleRequest(request, response, runtime, topics, hostAdapter);
   });
   const port = await listen(server, requestedPort);
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -53,6 +57,7 @@ async function handleRequest(
   response: ServerResponse,
   runtime: ExperienceRuntime,
   topics: PublicTopicService,
+  hostAdapter?: ExperienceHostAdapter,
 ): Promise<void> {
   try {
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
@@ -60,6 +65,15 @@ async function handleRequest(
 
     if (request.method === "GET" && path === "/health") {
       sendJson(response, 200, { ok: true, service: "experience-runtime" });
+      return;
+    }
+
+    if (request.method === "POST" && path === "/api/host") {
+      if (!hostAdapter) {
+        sendJson(response, 503, { error: "host_adapter_unavailable" });
+        return;
+      }
+      sendJson(response, 200, await hostAdapter.handle(await readJson(request)));
       return;
     }
 
